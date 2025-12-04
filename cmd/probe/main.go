@@ -4,306 +4,345 @@ import (
 	"context"
 	"database/sql"
 	"flag"
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"google.golang.org/protobuf/proto"
 
-	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
-	walog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-// probe record in DB: one row per reaction message we send
-type probeRecord struct {
-	TargetJID      string
-	TargetMsgID    string
-	ReactionMsgID  string
-	Action         string
-	Emoji          string
-	SendTSUnixNano int64
+type probeConfig struct {
+	clientDBPath string
+	probeDBPath  string
+	toJIDStr     string
+	msgID        string
+	rate         time.Duration
+	emoji        string
+	maxRuntime   time.Duration
+}
+
+// create or migrate probes table
+func initProbeDB(db *sql.DB) error {
+	const ddl = `
+CREATE TABLE IF NOT EXISTS probes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    probe_id       INTEGER NOT NULL,
+    msg_id         TEXT    NOT NULL,
+    send_ts_ns     INTEGER NOT NULL,
+    receipt_ts_ns  INTEGER,
+    receipt_type   TEXT
+);
+`
+	_, err := db.Exec(ddl)
+	return err
 }
 
 func main() {
-	var (
-		storeDBPath   string
-		probeDBPath   string
-		toJIDStr      string
-		targetMsgID   string
-		emoji         string
-		rateMillis    int
-		maxProbes     int
-	)
+	cfg := parseFlags()
 
-	flag.StringVar(&storeDBPath, "db", "store.db", "Whatsmeow store DB path (sqlite)")
-	flag.StringVar(&probeDBPath, "probe-db", "probes.db", "SQLite DB path for probe results")
-	flag.StringVar(&toJIDStr, "to", "", "Target JID (e.g. 91989xxxxx@s.whatsapp.net)")
-	flag.StringVar(&targetMsgID, "target-msg-id", "", "Existing message ID to react to")
-	flag.StringVar(&emoji, "emoji", "👍", "Emoji to use for reaction probes")
-	flag.IntVar(&rateMillis, "rate", 3000, "Interval between probes in milliseconds")
-	flag.IntVar(&maxProbes, "max-probes", 0, "Maximum number of reaction probes (0 = infinite)")
-	flag.Parse()
+	// Logging
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+	log.Info().Msg("Starting probe client")
 
-	if toJIDStr == "" {
-		log.Fatal("-to is required")
-	}
-	if targetMsgID == "" {
-		log.Fatal("-target-msg-id is required (ID of an existing message to react to)")
-	}
-	if emoji == "" {
-		log.Fatal("-emoji cannot be empty (use something like \"👍\")")
-	}
-
-	// ----- init probe DB -----
-	probeDB, err := sql.Open("sqlite3", probeDBPath)
+	// Open probe DB
+	probeDB, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on", cfg.probeDBPath))
 	if err != nil {
-		log.Fatalf("failed to open probe DB: %v", err)
+		log.Fatal().Err(err).Msg("Failed to open probe DB")
 	}
 	defer probeDB.Close()
 
 	if err := initProbeDB(probeDB); err != nil {
-		log.Fatalf("failed to init probe DB schema: %v", err)
+		log.Fatal().Err(err).Msg("Failed to init probe DB schema")
 	}
 
-	// ----- init WhatsMeow client -----
-	container, err := sqlstore.New("sqlite3", storeDBPath, nil)
+	// WhatsApp client store
+	container, err := sqlstore.New(
+		"sqlite3",
+		fmt.Sprintf("file:%s?_foreign_keys=on", cfg.clientDBPath),
+		waLog.Stdout("DB", "INFO", true),
+	)
 	if err != nil {
-		log.Fatalf("failed to init sqlstore: %v", err)
+		log.Fatal().Err(err).Msg("Failed to create WhatsApp store container")
 	}
+	defer container.Close()
 
 	deviceStore, err := container.GetFirstDevice()
 	if err != nil {
-		log.Fatalf("failed to get device: %v", err)
+		log.Fatal().Err(err).Msg("Failed to get device store")
+	}
+	if deviceStore == nil {
+		log.Fatal().Msg("No device found in client DB. Pair a device first using the example-login tool.")
 	}
 
-	logger := walog.Stdout("Main", "INFO", true)
-	client := whatsmeow.NewClient(deviceStore, logger)
+	clientLog := waLog.Stdout("Client", "DEBUG", true)
+	client := whatsmeow.NewClient(deviceStore, clientLog)
 
-	// ----- receipt handler -----
-	var (
-		probeDBMu sync.Mutex // serialize DB writes for safety
-	)
-
+	// Event handler: record receipts for reaction messages
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Receipt:
-			handleReceiptEvent(probeDB, &probeDBMu, v)
+			handleReceiptEvent(probeDB, v)
 		}
 	})
 
-	// ----- connect -----
 	if client.Store.ID == nil {
-		log.Fatal("no device ID in store; you must register / login this device first")
+		log.Fatal().Msg("No logged in session in client DB. Pair first before running probe.")
 	}
 
-	err = client.Connect()
+	// Connect
+	if err := client.Connect(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to connect to WhatsApp")
+	}
+	defer client.Disconnect()
+
+	// Global context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Parse target JID
+	toJID, err := types.ParseJID(cfg.toJIDStr)
 	if err != nil {
-		log.Fatalf("failed to connect: %v", err)
-	}
-	log.Printf("[MAIN] connected as %s", client.Store.ID.String())
-
-	// ----- start probe loop -----
-	toJID, err := types.ParseJID(toJIDStr)
-	if err != nil {
-		log.Fatalf("invalid -to JID: %v", err)
+		log.Fatal().Err(err).Str("jid", cfg.toJIDStr).Msg("Invalid target JID")
 	}
 
-	go func() {
-		runProbeLoop(client, probeDB, &probeDBMu, toJID, types.MessageID(targetMsgID), emoji, rateMillis, maxProbes)
-	}()
+	// Determine base message ID: either provided or send "Hello World!"
+	baseMsgID := cfg.msgID
+	if baseMsgID == "" {
+		log.Info().Str("to", toJID.String()).Msg("No -msg-id provided, sending base message 'Hello World!'")
+		baseMsgID, err = sendBaseMessage(ctx, client, toJID)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to send base message")
+		}
+		log.Info().Str("msg_id", baseMsgID).Msg("Base message ID for reactions")
+	} else {
+		log.Info().Str("msg_id", baseMsgID).Msg("Using provided base message ID for reactions")
+	}
 
-	// ----- wait for Ctrl+C -----
+	// Probe loop (reactions only)
+	start := time.Now()
+	log.Info().
+		Dur("rate", cfg.rate).
+		Dur("max_runtime", cfg.maxRuntime).
+		Msg("Starting reaction probe loop")
+
+	go runProbeLoop(ctx, client, probeDB, cfg, toJID, baseMsgID, start, cancel)
+
+	// Wait for signal or context cancel
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
 
-	log.Println("[MAIN] shutting down...")
-	client.Disconnect()
+	select {
+	case sig := <-sigCh:
+		log.Info().Str("signal", sig.String()).Msg("Signal received, shutting down")
+		cancel()
+	case <-ctx.Done():
+		log.Info().Msg("Context canceled (likely max runtime reached), shutting down")
+	}
+
+	// Allow some time for pending DB writes
+	time.Sleep(1 * time.Second)
+	log.Info().Msg("Probe stopped cleanly")
 }
 
-// initProbeDB creates the schema we actually need for RTT analysis
-func initProbeDB(db *sql.DB) error {
-	schema := `
-CREATE TABLE IF NOT EXISTS probes (
-	id              INTEGER PRIMARY KEY AUTOINCREMENT,
-	target_jid      TEXT    NOT NULL,
-	target_msg_id   TEXT    NOT NULL,
-	reaction_msg_id TEXT    NOT NULL UNIQUE,
-	action          TEXT    NOT NULL,
-	emoji           TEXT    NOT NULL,
-	send_ts_ns      INTEGER NOT NULL,
-	receipt_type    TEXT,
-	receipt_ts_ns   INTEGER
-);
-`
-	_, err := db.Exec(schema)
-	return err
+// parseFlags reads CLI flags and returns config
+func parseFlags() probeConfig {
+	var (
+		clientDB  = flag.String("db", "", "Path to WhatsApp client SQLite DB (login session)")
+		probeDB   = flag.String("probe-db", "", "Path to probe SQLite DB (measurement data)")
+		to        = flag.String("to", "", "Target JID, e.g. 919389442656@s.whatsapp.net")
+		msgID     = flag.String("msg-id", "", "Existing base message ID to react to (optional)")
+		rateMS    = flag.Int("rate", 3000, "Probe interval in milliseconds")
+		emoji     = flag.String("emoji", "🙂", "Emoji to use for reactions")
+		maxRunSec = flag.Int("max-runtime", 0, "Max runtime in seconds (0 = unlimited)")
+	)
+
+	flag.Parse()
+
+	if *clientDB == "" || *probeDB == "" || *to == "" {
+		fmt.Fprintf(os.Stderr, "Usage: probe -db client.db -probe-db probes.db -to <jid> [-msg-id <id>] [-rate 3000] [-emoji 🙂] [-max-runtime 21600]\n")
+		os.Exit(1)
+	}
+
+	cfg := probeConfig{
+		clientDBPath: *clientDB,
+		probeDBPath:  *probeDB,
+		toJIDStr:     *to,
+		msgID:        *msgID,
+		rate:         time.Duration(*rateMS) * time.Millisecond,
+		emoji:        *emoji,
+		maxRuntime:   time.Duration(*maxRunSec) * time.Second,
+	}
+
+	return cfg
 }
 
-// runProbeLoop periodically sends add/remove reactions to a fixed target message
+// sendBaseMessage sends "Hello World!" and returns its message ID
+func sendBaseMessage(ctx context.Context, client *whatsmeow.Client, toJID types.JID) (string, error) {
+	msg := &waProto.Message{
+		Conversation: proto.String("Hello World!"),
+	}
+	resp, err := client.SendMessage(ctx, toJID, msg)
+	if err != nil {
+		return "", err
+	}
+	log.Info().
+		Str("msgID", resp.ID).
+		Str("to", toJID.String()).
+		Msg("[SEND] Hello World!")
+
+	return resp.ID, nil
+}
+
+// runProbeLoop sends REMOVE + ADD reactions at the chosen interval
 func runProbeLoop(
+	ctx context.Context,
 	client *whatsmeow.Client,
-	db *sql.DB,
-	dbMu *sync.Mutex,
-	targetJID types.JID,
-	targetMsgID types.MessageID,
-	emoji string,
-	rateMillis int,
-	maxProbes int,
+	probeDB *sql.DB,
+	cfg probeConfig,
+	toJID types.JID,
+	baseMsgID string,
+	start time.Time,
+	cancel context.CancelFunc,
 ) {
-	ticker := time.NewTicker(time.Duration(rateMillis) * time.Millisecond)
+	ticker := time.NewTicker(cfg.rate)
 	defer ticker.Stop()
 
-	ctx := context.Background()
-
-	add := true
-	sentCount := 0
-
-	log.Printf("[PROBE] starting probe loop: targetJID=%s targetMsgID=%s emoji=%q rate=%dms maxProbes=%d",
-		targetJID.String(), string(targetMsgID), emoji, rateMillis, maxProbes)
+	probeID := 1
 
 	for {
-		if maxProbes > 0 && sentCount >= maxProbes {
-			log.Printf("[PROBE] reached maxProbes=%d, stopping loop", maxProbes)
+		select {
+		case <-ctx.Done():
 			return
+		case now := <-ticker.C:
+			// Stop if max runtime exceeded
+			if cfg.maxRuntime > 0 && time.Since(start) >= cfg.maxRuntime {
+				log.Info().
+					Dur("max_runtime", cfg.maxRuntime).
+					Msg("Max runtime reached, stopping probe loop")
+				cancel()
+				return
+			}
+
+			// 1) REMOVE reaction
+			removeSendTS := time.Now().UnixNano()
+			rmID, err := sendReaction(ctx, client, toJID, baseMsgID, "", types.ReactionRemove)
+			if err != nil {
+				log.Error().Err(err).Int("probe_id", probeID).Msg("Failed to send REMOVE reaction")
+			} else {
+				if err := insertProbe(probeDB, probeID, rmID, removeSendTS, "remove_sent"); err != nil {
+					log.Error().Err(err).Str("msg_id", rmID).Msg("Failed to insert REMOVE probe row")
+				}
+			}
+
+			// Short delay between remove and add to decorrelate slightly
+			time.Sleep(50 * time.Millisecond)
+
+			// 2) ADD reaction
+			addSendTS := time.Now().UnixNano()
+			addID, err := sendReaction(ctx, client, toJID, baseMsgID, cfg.emoji, types.ReactionAdd)
+			if err != nil {
+				log.Error().Err(err).Int("probe_id", probeID).Msg("Failed to send ADD reaction")
+			} else {
+				if err := insertProbe(probeDB, probeID, addID, addSendTS, "add_sent"); err != nil {
+					log.Error().Err(err).Str("msg_id", addID).Msg("Failed to insert ADD probe row")
+				}
+			}
+
+			log.Debug().
+				Int("probe_id", probeID).
+				Time("tick_time", now).
+				Msg("Probe tick completed (REMOVE + ADD)")
+			probeID++
 		}
-
-		<-ticker.C
-
-		action := "add"
-		text := emoji
-		if !add {
-			action = "remove"
-			text = "" // empty text = remove reaction
-		}
-
-		resp, err := sendReaction(ctx, client, targetJID, targetMsgID, text)
-		if err != nil {
-			log.Printf("[PROBE] sendReaction error: %v", err)
-			continue
-		}
-
-		rec := probeRecord{
-			TargetJID:      targetJID.String(),
-			TargetMsgID:    string(targetMsgID),
-			ReactionMsgID:  string(resp.ID),
-			Action:         action,
-			Emoji:          text,
-			SendTSUnixNano: resp.Timestamp.UnixNano(),
-		}
-
-		dbMu.Lock()
-		if err := insertProbe(db, &rec); err != nil {
-			log.Printf("[PROBE] insertProbe error for %s: %v", rec.ReactionMsgID, err)
-		} else {
-			log.Printf("[PROBE] %s reaction: targetMsg=%s reactionMsg=%s send_ts_ns=%d",
-				action, rec.TargetMsgID, rec.ReactionMsgID, rec.SendTSUnixNano)
-		}
-		dbMu.Unlock()
-
-		add = !add
-		sentCount++
 	}
 }
 
-// sendReaction sends a reaction to an existing message
+// sendReaction wraps whatsmeow's SendReaction call and returns the reaction message ID
 func sendReaction(
 	ctx context.Context,
 	client *whatsmeow.Client,
-	targetJID types.JID,
-	targetMsgID types.MessageID,
-	text string,
-) (*whatsmeow.SendResponse, error) {
-	// Build ReactionMessage
-	r := &waProto.ReactionMessage{
-		Key: &waProto.MessageKey{
-			RemoteJID: proto.String(targetJID.String()),
-			FromMe:    proto.Bool(true),
-			ID:        proto.String(string(targetMsgID)),
-		},
-		// Text: emoji for add; empty string for remove
-		Text: proto.String(text),
-		// SenderTimestampMS: we can leave nil and let WA fill it
+	chat types.JID,
+	baseMsgID string,
+	emoji string,
+	rType types.ReactionType,
+) (string, error) {
+	msgKey := &waProto.MessageKey{
+		ID:        baseMsgID,
+		FromMe:    true,
+		RemoteJID: proto.String(chat.String()),
 	}
 
-	msg := &waProto.Message{
-		ReactionMessage: r,
+	// NOTE: Depending on whatsmeow version, the signature may differ slightly.
+	// This assumes:
+	//   SendReaction(ctx, chat, msgKey, emoji, rType) (whatsmeow.SendResponse, error)
+	resp, err := client.SendReaction(ctx, chat, msgKey, emoji, rType)
+	if err != nil {
+		return "", err
 	}
 
-	resp, err := client.SendMessage(ctx, targetJID, "", msg)
-	return resp, err
+	log.Debug().
+		Str("targetMsg", baseMsgID).
+		Str("reactionMsgID", resp.ID).
+		Str("emoji", emoji).
+		Str("type", string(rType)).
+		Msg("[REACT] sent")
+
+	return resp.ID, nil
 }
 
-// insertProbe stores a sent reaction message
-func insertProbe(db *sql.DB, rec *probeRecord) error {
+// insertProbe writes a new probe row (one per reaction message sent)
+func insertProbe(db *sql.DB, probeID int, msgID string, sendTS int64, kind string) error {
 	_, err := db.Exec(
-		`INSERT INTO probes (target_jid, target_msg_id, reaction_msg_id, action, emoji, send_ts_ns)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-		rec.TargetJID,
-		rec.TargetMsgID,
-		rec.ReactionMsgID,
-		rec.Action,
-		rec.Emoji,
-		rec.SendTSUnixNano,
+		`INSERT INTO probes (probe_id, msg_id, send_ts_ns, receipt_ts_ns, receipt_type)
+         VALUES (?, ?, ?, NULL, ?)`,
+		probeID, msgID, sendTS, kind,
 	)
 	return err
 }
 
-// handleReceiptEvent records receipts for reaction messages we know about.
-// Any receipt for unknown IDs is silently ignored (no more spam).
-func handleReceiptEvent(db *sql.DB, dbMu *sync.Mutex, v *events.Receipt) {
-	if len(v.MessageIDs) == 0 {
+// handleReceiptEvent updates existing probe rows when receipts arrive
+func handleReceiptEvent(probeDB *sql.DB, v *events.Receipt) {
+	if v.Type != types.ReceiptTypeSender && v.Type != types.ReceiptTypeInactive {
 		return
 	}
 
-	// We only care about 'sender' and 'inactive' types for RTT
+	receiptTS := time.Now().UnixNano()
 	typ := string(v.Type)
 
-	dbMu.Lock()
-	defer dbMu.Unlock()
-
-	for _, mid := range v.MessageIDs {
-		err := updateReceipt(db, string(mid), typ, v.Timestamp)
+	for _, id := range v.MessageIDs {
+		res, err := probeDB.Exec(
+			`UPDATE probes
+             SET receipt_ts_ns = ?, receipt_type = ?
+             WHERE msg_id = ? AND receipt_ts_ns IS NULL`,
+			receiptTS, typ, id,
+		)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				// Not one of our probe reaction messages; ignore silently
-				continue
-			}
-			log.Printf("[RECEIPT] updateReceipt error for %s: %v", mid, err)
+			log.Error().Err(err).Str("msg_id", id).Msg("recordReceipt update failed")
+			continue
+		}
+		aff, _ := res.RowsAffected()
+		if aff == 0 {
+			// Not fatal, just noisy: we might get receipts for messages we did not mark as probes
+			log.Debug().Str("msg_id", id).Msg("recordReceipt: no matching probe row")
+		} else {
+			log.Debug().
+				Str("msg_id", id).
+				Int64("rows", aff).
+				Str("type", typ).
+				Msg("recordReceipt: updated probe row")
 		}
 	}
-}
-
-// updateReceipt updates a row for a known reaction message ID
-func updateReceipt(db *sql.DB, reactionMsgID string, receiptType string, ts time.Time) error {
-	res, err := db.Exec(
-		`UPDATE probes
-		 SET receipt_type = ?, receipt_ts_ns = ?
-		 WHERE reaction_msg_id = ? AND receipt_ts_ns IS NULL`,
-		receiptType,
-		ts.UnixNano(),
-		reactionMsgID,
-	)
-	if err != nil {
-		return err
-	}
-
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if affected == 0 {
-		// No row -> behave like sql.ErrNoRows for the caller
-		return sql.ErrNoRows
-	}
-	return nil
 }
