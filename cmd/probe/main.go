@@ -29,6 +29,7 @@ const (
 CREATE TABLE IF NOT EXISTS probes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   probe_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
   msg_id TEXT NOT NULL,
   send_ts_ns INTEGER NOT NULL,
   receipt_ts_ns INTEGER NOT NULL,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS probes (
 // ProbeInfo holds info about a single reaction message we sent.
 type ProbeInfo struct {
 	ProbeID   int64
+	Action    string // "ADD" or "REMOVE"
 	SendTSNS  int64
 	MessageID string
 }
@@ -61,7 +63,7 @@ func NewProbeRecorder(db *sql.DB) *ProbeRecorder {
 }
 
 // RegisterSend is called right after a reaction is sent.
-func (pr *ProbeRecorder) RegisterSend(msgID types.MessageID, t time.Time) int64 {
+func (pr *ProbeRecorder) RegisterSend(msgID types.MessageID, action string, t time.Time) int64 {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
@@ -71,6 +73,7 @@ func (pr *ProbeRecorder) RegisterSend(msgID types.MessageID, t time.Time) int64 
 
 	info := ProbeInfo{
 		ProbeID:   probeID,
+		Action:    action,
 		SendTSNS:  t.UnixNano(),
 		MessageID: idStr,
 	}
@@ -97,9 +100,10 @@ func (pr *ProbeRecorder) HandleReceipt(rcpt *events.Receipt) {
 		receiptType := fmt.Sprint(rcpt.Type)
 
 		_, err := pr.db.Exec(
-			`INSERT INTO probes (probe_id, msg_id, send_ts_ns, receipt_ts_ns, receipt_type)
-         VALUES (?, ?, ?, ?, ?)`,
+			`INSERT INTO probes (probe_id, action, msg_id, send_ts_ns, receipt_ts_ns, receipt_type)
+         VALUES (?, ?, ?, ?, ?, ?)`,
 			info.ProbeID,
+			info.Action,
 			info.MessageID,
 			info.SendTSNS,
 			receiptNS,
@@ -110,8 +114,9 @@ func (pr *ProbeRecorder) HandleReceipt(rcpt *events.Receipt) {
 			continue
 		}
 
-		stdlog.Printf("recordReceipt: probe_id=%d msg_id=%s type=%s rtt_ms=%.3f",
+		stdlog.Printf("recordReceipt: probe_id=%d action=%s msg_id=%s type=%s rtt_ms=%.3f",
 			info.ProbeID,
+			info.Action,
 			info.MessageID,
 			receiptType,
 			float64(receiptNS-info.SendTSNS)/1e6,
@@ -160,8 +165,8 @@ func ensureBaseMessageID(
 	return baseID, nil
 }
 
-// sendReaction sends a single reaction to the given base message.
-// We only ever "add/update" the same emoji; no explicit remove.
+// sendReaction sends a reaction (add or remove) to the given base message.
+// Pass emoji to add/update a reaction, or empty string "" to remove it.
 func sendReaction(
 	ctx context.Context,
 	client *whatsmeow.Client,
@@ -289,7 +294,7 @@ func main() {
 
 	// ---------- Probe loop ----------
 	interval := time.Duration(*rateMs) * time.Millisecond
-	stdlog.Printf("Starting probe loop: interval=%s, emoji=%q", interval, *emoji)
+	stdlog.Printf("Starting probe loop: interval=%s, emoji=%q (alternating ADD/REMOVE)", interval, *emoji)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -302,6 +307,9 @@ func main() {
 		stdlog.Printf("Max runtime: %s", maxRuntime)
 	}
 
+	// Toggle between ADD and REMOVE
+	nextIsAdd := true
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -313,13 +321,26 @@ func main() {
 			return
 
 		case t := <-ticker.C:
-			msgID, err := sendReaction(ctx, client, toJID, baseMsgID, *emoji)
+			var action string
+			var reactionEmoji string
+
+			if nextIsAdd {
+				action = "ADD"
+				reactionEmoji = *emoji
+			} else {
+				action = "REMOVE"
+				reactionEmoji = "" // Empty string removes reaction
+			}
+
+			msgID, err := sendReaction(ctx, client, toJID, baseMsgID, reactionEmoji)
 			if err != nil {
-				stdlog.Printf("sendReaction error: %v", err)
+				stdlog.Printf("sendReaction error (action=%s): %v", action, err)
 				continue
 			}
-			probeID := recorder.RegisterSend(msgID, t)
-			stdlog.Printf("Sent reaction probe_id=%d reaction_msg_id=%s", probeID, string(msgID))
+			probeID := recorder.RegisterSend(msgID, action, t)
+			stdlog.Printf("Sent reaction probe_id=%d action=%s reaction_msg_id=%s", probeID, action, string(msgID))
+
+			nextIsAdd = !nextIsAdd // Toggle for next iteration
 		}
 	}
 }
