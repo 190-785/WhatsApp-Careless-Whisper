@@ -81,7 +81,13 @@ FROM probes;
 
 ## 📈 Replication Results
 
-I am currently running the replication experiments. The detailed results, including RTT analysis and findings compared to the original paper, will be updated here soon.
+Despite implementing the probing mechanisms described in the original paper, I have not yet been able to replicate the distinct RTT patterns reported by the authors.
+
+**Current Observations:**
+*   **Uniform RTTs:** The Round Trip Time (RTT) measurements currently fall within a similar range regardless of the target user's actual status (e.g., online vs. offline but receivable).
+*   **Non-Receivable Distinction:** The only significant deviation observed is when the message is strictly non-receivable (e.g., the user is completely unreachable), which results in a much longer RTT.
+
+Further experimentation with different probing parameters and network configurations is needed to fully reproduce the paper's findings.
 
 ## 📂 Project Structure
 
